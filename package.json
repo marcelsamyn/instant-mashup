@@ -1,0 +1,20 @@
+{
+  "name": "instant-mashup",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot server/index.ts",
+    "start": "bun server/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "19",
+    "react-dom": "19"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "@types/react": "19",
+    "@types/react-dom": "19",
+    "typescript": "^7.0.2"
+  }
+}
