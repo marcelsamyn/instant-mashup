@@ -58,7 +58,12 @@ export class BufferStore {
     if (existing) return existing;
     const url = `/api/tracks/${need.trackId}/audio/${need.source}?rate=${need.rate.toFixed(5)}&semitones=${need.semitones}`;
     const promise = fetch(url).then(async (res) => {
-      if (!res.ok) throw new Error(`Could not load ${need.source} audio (${res.status})`);
+      if (!res.ok) {
+        // The server explains limits and repairs in an { error } body; show that to the user.
+        const body: unknown = await res.json().catch(() => null);
+        const reason = typeof body === "object" && body !== null && "error" in body ? String(body.error) : `status ${res.status}`;
+        throw new Error(`Could not load ${need.source} audio: ${reason}`);
+      }
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     });
     promise.catch(() => {

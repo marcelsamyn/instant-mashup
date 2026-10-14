@@ -1,9 +1,12 @@
 import { type SearchResult, thumbnailUrl } from "../shared/types";
+import { config } from "./config";
+import { concurrency } from "./limits";
 import { run } from "./run";
 
-// The Homebrew yt-dlp goes stale quickly and YouTube then answers 403; run a pinned recent release.
-const YT_DLP = ["uvx", "--from", "yt-dlp[default]==2026.08.19", "yt-dlp", "--no-update", "--js-runtimes", "node"];
-const MAX_DURATION_SEC = 15 * 60;
+const YT_DLP = config.tools.ytDlp;
+/** 0 means no length limit. */
+const MAX_DURATION_SEC = config.maxSongMinutes > 0 ? config.maxSongMinutes * 60 : Number.POSITIVE_INFINITY;
+const searchSlot = concurrency(config.parallelSearches);
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
 /** Accepts a bare video id or any common YouTube URL form. Returns null when it is neither. */
@@ -35,7 +38,7 @@ interface FlatEntry {
 }
 
 export async function searchVideos(query: string): Promise<SearchResult[]> {
-  const out = await run([...YT_DLP, `ytsearch12:${query}`, "--flat-playlist", "-J"]);
+  const out = await searchSlot(() => run([...YT_DLP, `ytsearch12:${query}`, "--flat-playlist", "-J"]));
   const entries: FlatEntry[] = JSON.parse(out).entries ?? [];
   return entries.flatMap((e) => {
     if (typeof e.id !== "string" || !VIDEO_ID.test(e.id)) return [];
@@ -59,13 +62,31 @@ export interface VideoInfo {
   duration: number;
 }
 
+const DOWNLOAD_ATTEMPTS = 3;
+
+/**
+ * Runs yt-dlp, retrying failures. YouTube sometimes answers a fresh stream URL with HTTP 403 and
+ * accepts the next one, so a single refusal should not fail the song.
+ */
+async function runWithRetry(cmd: string[], id: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await run(cmd);
+      return;
+    } catch (err) {
+      if (attempt >= DOWNLOAD_ATTEMPTS) throw err;
+      console.warn(JSON.stringify({ event: "download_retry", id, attempt, message: err instanceof Error ? err.message : String(err) }));
+      await Bun.sleep(2000 * attempt);
+    }
+  }
+}
+
 /** Downloads the audio as 44.1 kHz stereo WAV to `<dir>/source.wav`. */
 export async function downloadAudio(id: string, dir: string): Promise<VideoInfo> {
-  await run([
+  await runWithRetry([
     ...YT_DLP,
     "--no-playlist",
-    "--match-filter",
-    `duration <= ${MAX_DURATION_SEC}`,
+    ...(Number.isFinite(MAX_DURATION_SEC) ? ["--match-filter", `duration <= ${MAX_DURATION_SEC}`] : []),
     "-f",
     "bestaudio/best",
     "-x",
@@ -77,9 +98,13 @@ export async function downloadAudio(id: string, dir: string): Promise<VideoInfo>
     "-o",
     `${dir}/source.%(ext)s`,
     `https://www.youtube.com/watch?v=${id}`,
-  ]);
+  ], id);
   if (!(await Bun.file(`${dir}/source.wav`).exists())) {
-    throw new Error(`No audio downloaded. The video may be longer than ${MAX_DURATION_SEC / 60} minutes or unavailable.`);
+    throw new Error(
+      Number.isFinite(MAX_DURATION_SEC)
+        ? `No audio downloaded. The video may be longer than ${MAX_DURATION_SEC / 60} minutes or unavailable.`
+        : "No audio downloaded. The video may be unavailable.",
+    );
   }
   const info: FlatEntry = await Bun.file(`${dir}/source.info.json`).json();
   return {

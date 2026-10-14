@@ -39,6 +39,47 @@ The glass gets dirty with use. Taps on the timeline screen and the display can l
 | ⌘Z / ⌘⇧Z | Undo / redo |
 | + / − | Zoom |
 
+## Deploy with Docker Swarm
+
+GitHub Actions builds the image on every push to `main` and publishes it to `ghcr.io/marcelsamyn/instant-mashup` (private, linux/amd64). The image includes everything: Python 3.11, librosa, Demucs with its model, yt-dlp, ffmpeg and Deno. A new container downloads nothing except songs.
+
+On the swarm node:
+
+1. Log in to GHCR once, with a GitHub token that has the `read:packages` scope:
+   ```bash
+   echo "$GHCR_TOKEN" | docker login ghcr.io -u marcelsamyn --password-stdin
+   ```
+2. Deploy the stack. The password is required, and the deploy stops without it:
+   ```bash
+   export ACCESS_PASSWORD='something-you-share-with-friends'
+   docker stack deploy --with-registry-auth -c deploy/stack.yml mashup
+   ```
+3. Open `http://<server>:5180` and enter the password. The server refuses to start on a public interface without `ACCESS_PASSWORD` (set `ALLOW_OPEN=1` to override). Put HTTPS in front before you share the link (see below).
+
+If your swarm UI deploys from a pasted stack file, paste `deploy/stack.yml` and set `ACCESS_PASSWORD` (and any limit below) as stack environment variables.
+
+**Behind a reverse proxy** (Traefik, Caddy, nginx) on the same overlay network, remove the `ports` block, route the proxy to port 5180 of the `app` service, and set `TRUST_PROXY=1`. Without that setting, every visitor shares the proxy's IP address and therefore one rate limit. Without a proxy, keep `mode: host` on the published port for the same reason.
+
+### Protection against heavy use
+
+Limits work at two levels. The container cannot take over the server, and the app refuses work before it piles up.
+
+| Setting | Default | What it protects |
+| --- | --- | --- |
+| `ACCESS_PASSWORD` | required | Only people with the password can use the API. Changing it signs everyone out. |
+| `CPU_LIMIT` / `MEMORY_LIMIT` | 2 / 4G | Hard ceiling for the container, including stem separation. Use a whole number for `CPU_LIMIT`. |
+| `MAX_SONG_MINUTES` | 10 | Longer videos are refused, so nobody splits a 2-hour mix. |
+| `MAX_LIBRARY_GB` | 20 | Disk budget. Past it, the songs used least recently are deleted. A song takes about 250 MB. |
+| `MAX_QUEUED_SONGS` | 6 | New songs are refused (try again later) while this many are still processing. |
+| `ADDS_PER_HOUR_PER_IP` / `ADDS_PER_DAY` | 10 / 100 | New songs per person per hour, and for everyone per day. |
+| `SEARCHES_PER_MINUTE_PER_IP` | 20 | YouTube searches per person. |
+| `RENDERS_PER_HOUR_PER_IP` | 60 | Tempo and pitch renders per person. Cached renders do not count. Each song keeps its 12 newest renders, and renders count toward the disk budget. |
+| `PARALLEL_DOWNLOADS` / `PARALLEL_ANALYSES` / `PARALLEL_RENDERS` | 2 / 1 / 2 | Heavy jobs at the same time. Stem separation always runs one at a time. |
+
+Set any of these as environment variables before `docker stack deploy`. `0` turns a limit off. The pids limit (256) and the log rotation (3 × 10 MB) are fixed in the stack file.
+
+On CPU, splitting stems takes about as long as the song plays, depending on the server. Songs wait in a queue, and the library shows their progress.
+
 ## How it works
 
 - `server/` is a Bun server. It searches and downloads with a pinned yt-dlp through `uvx`, runs the analysis and Demucs, and renders time-stretched audio on request with ffmpeg (`atempo`, plus `asetrate` for pitch). Everything is cached under `data/<video id>/`.
@@ -51,4 +92,5 @@ The glass gets dirty with use. Taps on the timeline screen and the display can l
 - Stretched and pitched renders are cached in `data/<id>/render/` and never cleaned up. Delete that folder to free disk space.
 - If a song's files go missing (for example, `data/` was copied without its audio), the server notices at startup and restores them: it downloads and splits that song again.
 - Analysis assumes a steady tempo. For a live recording or a song with tempo changes, fix small drift with Nudge.
-- The server listens on 127.0.0.1 only. Set `HOST` to change that.
+- Locally the server listens on 127.0.0.1 only. Set `HOST` to change that. The Docker image listens on all interfaces.
+- The song library is shared: everyone with the password sees every song. Arrangements stay in each person's browser.

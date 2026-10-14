@@ -1,20 +1,25 @@
-import { mkdir, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import path from "node:path";
 import { type Analysis, type AudioSource, STEMS, type StemLevels, type Track, thumbnailUrl } from "../shared/types";
+import { config } from "./config";
+import { concurrency } from "./limits";
 import { run } from "./run";
 import { downloadAudio } from "./youtube";
 
-const ROOT = path.join(import.meta.dir, "..");
-const DATA_DIR = path.join(ROOT, "data");
-const ANALYZE = ["uv", "run", "--script", path.join(ROOT, "analysis", "analyze.py")];
-const DEMUCS = [
-  "uv", "run", "--python", "3.11", "--with", "demucs==4.1.0", "--with", "soundfile",
-  "python", "-m", "demucs", "-n", "htdemucs",
-  "-d", process.platform === "darwin" && process.arch === "arm64" ? "mps" : "cpu",
-];
-
 const tracks = new Map<string, Track>();
-const trackDir = (id: string): string => path.join(DATA_DIR, id);
+const trackDir = (id: string): string => path.join(config.dataDir, id);
+const sourcePath = (id: string): string => path.join(trackDir(id), "source.wav");
+const stemPath = (id: string, stem: string): string => path.join(trackDir(id), "stems", `${stem}.wav`);
+
+const downloadSlot = concurrency(config.parallelDownloads);
+const analysisSlot = concurrency(config.parallelAnalyses);
+/** Demucs saturates the GPU or every CPU core it gets; separate one song at a time. */
+const separationSlot = concurrency(1);
+const renderSlot = concurrency(config.parallelRenders);
+
+/** Bumped on every library change; clients poll with it as an ETag and usually get a cheap 304. */
+let libraryVersion = 0;
+export const getLibraryVersion = (): number => libraryVersion;
 
 /** Saved metadata only; analysis and stem levels live in their own files. */
 type TrackMeta = Omit<Track, "analysis" | "stemLevels">;
@@ -37,29 +42,19 @@ async function save(track: Track): Promise<void> {
 
 function update(track: Track, patch: Partial<Track>): Promise<void> {
   Object.assign(track, patch);
+  libraryVersion++;
   return save(track);
-}
-
-/** Demucs saturates the GPU; separate one song at a time. */
-let separationQueue: Promise<unknown> = Promise.resolve();
-function enqueueSeparation<T>(job: () => Promise<T>): Promise<T> {
-  const next = separationQueue.then(job, job);
-  separationQueue = next.catch(() => undefined);
-  return next;
 }
 
 async function separate(id: string): Promise<void> {
   const dir = trackDir(id);
   const tmp = path.join(dir, "stems.tmp");
   await rm(tmp, { recursive: true, force: true });
-  await run([...DEMUCS, "-o", tmp, "--filename", "{stem}.{ext}", path.join(dir, "source.wav")]);
+  await run([...config.tools.demucs, "-o", tmp, "--filename", "{stem}.{ext}", sourcePath(id)]);
   await rm(path.join(dir, "stems"), { recursive: true, force: true });
   await rename(path.join(tmp, "htdemucs"), path.join(dir, "stems"));
   await rm(tmp, { recursive: true, force: true });
 }
-
-const sourcePath = (id: string): string => path.join(trackDir(id), "source.wav");
-const stemPath = (id: string, stem: string): string => path.join(trackDir(id), "stems", `${stem}.wav`);
 
 async function stemsOnDisk(id: string): Promise<boolean> {
   const found = await Promise.all(STEMS.map((s) => Bun.file(stemPath(id, s)).exists()));
@@ -81,12 +76,12 @@ async function processTrack(track: Track): Promise<void> {
   try {
     if (!(await Bun.file(sourcePath(track.id)).exists())) {
       await update(track, { status: "downloading", error: null });
-      const info = await downloadAudio(track.id, dir);
+      const info = await downloadSlot(() => downloadAudio(track.id, dir));
       await update(track, info);
     }
     if (!track.analysis) {
       await update(track, { status: "analyzing", error: null });
-      const out = await run([...ANALYZE, "track", path.join(dir, "source.wav")]);
+      const out = await analysisSlot(() => run([...config.tools.analyze, "track", sourcePath(track.id)]));
       await writeAtomic(path.join(dir, "analysis.json"), out);
       track.analysis = JSON.parse(out) as Analysis;
     }
@@ -96,10 +91,8 @@ async function processTrack(track: Track): Promise<void> {
     }
     if (!track.stemLevels) {
       await update(track, { status: "separating", error: null });
-      if (!(await stemsOnDisk(track.id))) {
-        await enqueueSeparation(() => separate(track.id));
-      }
-      const out = await run([...ANALYZE, "stems", path.join(dir, "analysis.json"), path.join(dir, "stems")]);
+      if (!(await stemsOnDisk(track.id))) await separationSlot(() => separate(track.id));
+      const out = await run([...config.tools.analyze, "stems", path.join(dir, "analysis.json"), path.join(dir, "stems")]);
       await writeAtomic(path.join(dir, "stems.json"), out);
       track.stemLevels = JSON.parse(out) as StemLevels;
     }
@@ -111,6 +104,7 @@ async function processTrack(track: Track): Promise<void> {
   } finally {
     active.delete(track.id);
   }
+  await enforceDiskBudget(track.id);
 }
 
 /** Starts a repair when any of a track's files are missing. Returns true when it did. */
@@ -128,8 +122,8 @@ export async function repairIfMissing(track: Track): Promise<boolean> {
 }
 
 export async function loadTracks(): Promise<void> {
-  await mkdir(DATA_DIR, { recursive: true });
-  for (const id of await readdir(DATA_DIR)) {
+  await mkdir(config.dataDir, { recursive: true });
+  for (const id of await readdir(config.dataDir)) {
     try {
       const meta = await readJson<TrackMeta>(path.join(trackDir(id), "track.json"));
       if (!meta) continue;
@@ -156,6 +150,11 @@ export function getTrack(id: string): Track | undefined {
   return tracks.get(id);
 }
 
+/** Songs still downloading, analysing or splitting. */
+export function queuedCount(): number {
+  return active.size;
+}
+
 /** Adds a video to the library and starts processing. Retries a track that failed before. */
 export async function addTrack(id: string, hint?: { title?: string; channel?: string }): Promise<Track> {
   const existing = tracks.get(id);
@@ -178,21 +177,78 @@ export async function addTrack(id: string, hint?: { title?: string; channel?: st
   return track;
 }
 
+const lastTouched = new Map<string, number>();
+
+/**
+ * Marks a song as used. The folder's modification time is the "last used" clock for the disk
+ * budget; it is touched at most once a minute per song.
+ */
+export async function touchTrack(id: string): Promise<void> {
+  const now = Date.now();
+  if (now - (lastTouched.get(id) ?? 0) < 60_000) return;
+  lastTouched.set(id, now);
+  const t = new Date(now);
+  await utimes(trackDir(id), t, t);
+}
+
+async function folderBytes(dir: string): Promise<number> {
+  const entries = await readdir(dir, { recursive: true, withFileTypes: true });
+  const sizes = await Promise.all(
+    entries.filter((e) => e.isFile()).map((e) => stat(path.join(e.parentPath, e.name)).then((s) => s.size, () => 0)),
+  );
+  return sizes.reduce((a, b) => a + b, 0);
+}
+
+/**
+ * Keeps the library under MAX_LIBRARY_GB by deleting the least recently used finished songs.
+ * Songs in progress and the song that just finished are never deleted.
+ */
+async function enforceDiskBudget(keepId: string): Promise<void> {
+  if (config.maxLibraryGb === 0) return;
+  const budget = config.maxLibraryGb * 1024 ** 3;
+  const usage = await Promise.all(
+    [...tracks.keys()].map(async (id) => ({
+      id,
+      bytes: await folderBytes(trackDir(id)).catch(() => 0),
+      usedAt: await stat(trackDir(id)).then((s) => s.mtimeMs, () => 0),
+    })),
+  );
+  let total = usage.reduce((a, u) => a + u.bytes, 0);
+  const candidates = usage.filter((u) => u.id !== keepId && !active.has(u.id)).sort((a, b) => a.usedAt - b.usedAt);
+  for (const victim of candidates) {
+    if (total <= budget) break;
+    tracks.delete(victim.id);
+    lastTouched.delete(victim.id);
+    await rm(trackDir(victim.id), { recursive: true, force: true });
+    total -= victim.bytes;
+    libraryVersion++;
+    console.info(JSON.stringify({ event: "track_evicted", id: victim.id, freedMb: Math.round(victim.bytes / 1024 ** 2) }));
+  }
+}
+
+export function audioFileExists(id: string, source: AudioSource): Promise<boolean> {
+  return Bun.file(source === "mix" ? sourcePath(id) : stemPath(id, source)).exists();
+}
+
+const renderPath = (id: string, source: AudioSource, rate: number, semitones: number): string =>
+  path.join(trackDir(id), "render", `${source}_r${rate.toFixed(5)}_s${semitones}.wav`);
+
+/** True when serving this audio means running ffmpeg (not the original file or a cached render). */
+export async function needsRender(id: string, source: AudioSource, rate: number, semitones: number): Promise<boolean> {
+  if (rate === 1 && semitones === 0) return false;
+  return !renders.has(renderPath(id, source, rate, semitones)) && !(await Bun.file(renderPath(id, source, rate, semitones)).exists());
+}
+
 const renders = new Map<string, Promise<string>>();
 
 /**
  * Path to a WAV of `source` played `rate` times faster and shifted by `semitones`, keeping pitch
  * independent from tempo. Renders are cached on disk.
  */
-export function audioFileExists(id: string, source: AudioSource): Promise<boolean> {
-  return Bun.file(source === "mix" ? sourcePath(id) : stemPath(id, source)).exists();
-}
-
 export function renderAudio(id: string, source: AudioSource, rate: number, semitones: number): Promise<string> {
-  const dir = trackDir(id);
   const input = source === "mix" ? sourcePath(id) : stemPath(id, source);
   if (rate === 1 && semitones === 0) return Promise.resolve(input);
-  const output = path.join(dir, "render", `${source}_r${rate.toFixed(5)}_s${semitones}.wav`);
+  const output = renderPath(id, source, rate, semitones);
   const pending = renders.get(output);
   if (pending) return pending;
   const job = (async () => {
@@ -203,12 +259,30 @@ export function renderAudio(id: string, source: AudioSource, rate: number, semit
     const tempo = atempoChain(rate / pitch);
     const filter = semitones === 0 ? tempo : `asetrate=${44100 * pitch},aresample=44100,${tempo}`;
     const tmp = `${output}.tmp.wav`;
-    await run(["ffmpeg", "-v", "error", "-y", "-i", input, "-af", filter, "-c:a", "pcm_s16le", tmp]);
+    await renderSlot(() => run(["ffmpeg", "-v", "error", "-y", "-i", input, "-af", filter, "-c:a", "pcm_s16le", tmp]));
     await rename(tmp, output);
+    await pruneRenders(id, output);
+    await enforceDiskBudget(id);
     return output;
   })().finally(() => renders.delete(output));
   renders.set(output, job);
   return job;
+}
+
+/** Renders kept per song. An arrangement needs at most 5 per lane (4 stems and the mix). */
+const MAX_RENDERS_PER_TRACK = 12;
+
+/** Deletes a song's oldest renders beyond MAX_RENDERS_PER_TRACK, never the one just written. */
+async function pruneRenders(id: string, keep: string): Promise<void> {
+  const dir = path.join(trackDir(id), "render");
+  const files = await Promise.all(
+    (await readdir(dir)).filter((f) => f.endsWith(".wav") && !f.endsWith(".tmp.wav")).map(async (f) => {
+      const file = path.join(dir, f);
+      return { file, usedAt: await stat(file).then((s) => s.mtimeMs, () => 0) };
+    }),
+  );
+  const old = files.filter((f) => f.file !== keep && !renders.has(f.file)).sort((a, b) => b.usedAt - a.usedAt);
+  for (const f of old.slice(MAX_RENDERS_PER_TRACK - 1)) await rm(f.file, { force: true });
 }
 
 /** ffmpeg's atempo takes 0.5..100 per stage; chain stages for bigger slow-downs. */

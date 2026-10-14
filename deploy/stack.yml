@@ -1,0 +1,64 @@
+# Docker Swarm stack for Instant Mashup (single node).
+#
+#   export ACCESS_PASSWORD='something-you-share-with-friends'
+#   docker stack deploy --with-registry-auth -c deploy/stack.yml mashup
+#
+# The image is private on GHCR: run `docker login ghcr.io` on the node first (see README).
+# Run one replica only: the library lives on one volume and jobs are coordinated in-process.
+
+services:
+  app:
+    image: ghcr.io/marcelsamyn/instant-mashup:${IMAGE_TAG:-latest}
+    environment:
+      ACCESS_PASSWORD: ${ACCESS_PASSWORD:?Set ACCESS_PASSWORD to the password you share with friends}
+      # Set to 1 when a reverse proxy (Traefik, Caddy, nginx) sits in front and sets X-Forwarded-For.
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      # App-level limits; 0 turns a limit off.
+      MAX_SONG_MINUTES: ${MAX_SONG_MINUTES:-10}
+      MAX_LIBRARY_GB: ${MAX_LIBRARY_GB:-20}
+      MAX_QUEUED_SONGS: ${MAX_QUEUED_SONGS:-6}
+      ADDS_PER_HOUR_PER_IP: ${ADDS_PER_HOUR_PER_IP:-10}
+      ADDS_PER_DAY: ${ADDS_PER_DAY:-100}
+      SEARCHES_PER_MINUTE_PER_IP: ${SEARCHES_PER_MINUTE_PER_IP:-20}
+      RENDERS_PER_HOUR_PER_IP: ${RENDERS_PER_HOUR_PER_IP:-60}
+      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-2}
+      PARALLEL_ANALYSES: ${PARALLEL_ANALYSES:-1}
+      PARALLEL_RENDERS: ${PARALLEL_RENDERS:-2}
+      # Match the CPU limit below so PyTorch and numba do not oversubscribe the quota.
+      OMP_NUM_THREADS: ${CPU_LIMIT:-2}
+    volumes:
+      - data:/app/data
+    ports:
+      # Host mode keeps real client IPs, which the per-person limits rely on.
+      # Behind a reverse proxy on the same overlay network, remove this and set TRUST_PROXY=1.
+      - target: 5180
+        published: ${PUBLISHED_PORT:-5180}
+        protocol: tcp
+        mode: host
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 1
+      update_config:
+        order: stop-first
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      resources:
+        # Hard ceiling for the whole app, including stem separation. Stems for a 10-minute song
+        # need about 3 GB, so keep memory at 4G or more.
+        limits:
+          cpus: "${CPU_LIMIT:-2}"
+          memory: ${MEMORY_LIMIT:-4G}
+          pids: 256
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+volumes:
+  data:
