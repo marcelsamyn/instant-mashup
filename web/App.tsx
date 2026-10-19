@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Track } from "../shared/types";
-import { addTrack, fetchTracks } from "./api";
+import { ApiError, addTrack, fetchTracks } from "./api";
+import { AccessGate } from "./components/AccessGate";
 import { type BufferLookup, BufferStore, bufferNeeds } from "./buffers";
 import { Inspector } from "./components/Inspector";
 import { Library } from "./components/Library";
@@ -99,6 +100,7 @@ export function App(): React.JSX.Element {
   const [ppb, setPpb] = useState(6);
   const [loading, setLoading] = useState<{ done: number; total: number } | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [locked, setLocked] = useState(false);
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error"; id: number } | null>(null);
 
   const project = history.present;
@@ -115,8 +117,9 @@ export function App(): React.JSX.Element {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Poll the library quickly while songs are processing, slowly otherwise.
+  // Poll the library quickly while songs are processing, slowly otherwise. Stops while locked.
   useEffect(() => {
+    if (locked) return;
     let alive = true;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async (): Promise<void> => {
@@ -127,6 +130,10 @@ export function App(): React.JSX.Element {
         setTracks((prev) => mergeTracks(prev, list));
         delay = list.some(isBusy) ? 1500 : 8000;
       } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          setLocked(true);
+          return;
+        }
         console.error("Library refresh failed", err);
       }
       if (alive) timer = setTimeout(poll, delay);
@@ -136,7 +143,7 @@ export function App(): React.JSX.Element {
       alive = false;
       clearTimeout(timer);
     };
-  }, []);
+  }, [locked]);
 
   /** Records an undo step. */
   const commit = useCallback((fn: (p: Project) => Project) => {
@@ -434,6 +441,7 @@ export function App(): React.JSX.Element {
           onDelete={deleteClip}
         />
       </div>
+      {locked && <AccessGate onUnlock={() => setLocked(false)} />}
       {toast && (
         <div key={toast.id} className={`toast toast-${toast.tone}`} role="status">
           {toast.text}

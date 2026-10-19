@@ -1,0 +1,74 @@
+# Docker Swarm stack for Instant Mashup behind Traefik (single node).
+#
+# Before the first deploy, on the node:
+#   mkdir -p /var/services/mashup/data && chown 1000:1000 /var/services/mashup/data
+#
+# Deploy from Portainer (Stacks → Add stack → paste this file, then set ACCESS_PASSWORD under
+# environment variables), or from a shell:
+#   ACCESS_PASSWORD='something-you-share-with-friends' \
+#     docker stack deploy --with-registry-auth -c deploy/stack.yml mashup
+#
+# Run one replica only: the library lives in one folder and jobs are coordinated in-process.
+
+services:
+  app:
+    image: ghcr.io/marcelsamyn/instant-mashup:${IMAGE_TAG:-latest}
+    environment:
+      ACCESS_PASSWORD: ${ACCESS_PASSWORD:?Set ACCESS_PASSWORD to the password you share with friends}
+      # Traefik sets X-Forwarded-For; the app takes the client address from it.
+      TRUST_PROXY: "1"
+      # Disk budget for songs, stems and renders. Past it the least recently used songs are deleted.
+      MAX_LIBRARY_GB: ${MAX_LIBRARY_GB:-20}
+      MAX_SONG_MINUTES: ${MAX_SONG_MINUTES:-10}
+      MAX_QUEUED_SONGS: ${MAX_QUEUED_SONGS:-6}
+      ADDS_PER_DAY: ${ADDS_PER_DAY:-100}
+      # Traefik is published in swarm ingress mode, which hides client addresses: every visitor
+      # arrives from the same internal IP, so these "per IP" limits are shared by everyone.
+      # They are sized for that. Switch Traefik's ports to `mode: host` to make them per person.
+      ADDS_PER_HOUR_PER_IP: ${ADDS_PER_HOUR_PER_IP:-30}
+      SEARCHES_PER_MINUTE_PER_IP: ${SEARCHES_PER_MINUTE_PER_IP:-60}
+      RENDERS_PER_HOUR_PER_IP: ${RENDERS_PER_HOUR_PER_IP:-240}
+      LOGIN_ATTEMPTS_PER_15_MIN_PER_IP: ${LOGIN_ATTEMPTS_PER_15_MIN_PER_IP:-30}
+      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-2}
+      PARALLEL_ANALYSES: ${PARALLEL_ANALYSES:-1}
+      PARALLEL_RENDERS: ${PARALLEL_RENDERS:-2}
+      # Match the CPU limit below so PyTorch and numba do not oversubscribe the quota.
+      OMP_NUM_THREADS: ${CPU_LIMIT:-3}
+    volumes:
+      - /var/services/mashup/data:/app/data
+    networks:
+      - traefik-public
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 1
+      update_config:
+        order: stop-first
+      restart_policy:
+        condition: any
+        delay: 5s
+        window: 60s
+      resources:
+        # Hard ceiling for the whole app, including stem separation (peak about 1.6 GB for a
+        # 2-minute song, about 3 GB for a 10-minute one).
+        limits:
+          cpus: "${CPU_LIMIT:-3}"
+          memory: ${MEMORY_LIMIT:-4G}
+          pids: 256
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: traefik-public
+        traefik.http.routers.mashup.rule: Host(`${MASHUP_HOST:-mashup.samyn.co}`)
+        traefik.http.routers.mashup.entrypoints: https
+        traefik.http.services.mashup.loadbalancer.server.port: "5180"
+
+networks:
+  traefik-public:
+    external: true
