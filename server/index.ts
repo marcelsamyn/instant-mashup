@@ -1,4 +1,5 @@
 import type { Server } from "bun";
+import type { GridOverrides } from "../shared/types";
 import index from "../web/index.html";
 import { accessRequired, hasAccess, login } from "./access";
 import { config } from "./config";
@@ -15,6 +16,8 @@ import {
   queuedCount,
   renderAudio,
   repairIfMissing,
+  isProcessing,
+  retuneTrack,
   touchTrack,
 } from "./tracks";
 import { parseVideoId, searchVideos } from "./youtube";
@@ -33,11 +36,39 @@ function isCrossSite(req: Request): boolean {
   }
 }
 
+/** Validates a tuner submission against the song's length. */
+function parseOverrides(body: unknown, duration: number): GridOverrides | string {
+  if (typeof body !== "object" || body === null) return "Expected { bpm, downbeat, key }";
+  const { bpm, downbeat, key } = body as Record<string, unknown>;
+  if (typeof bpm !== "number" || !(bpm >= 40 && bpm <= 250)) return "bpm must be a number between 40 and 250";
+  if (typeof downbeat !== "number" || !(downbeat >= -10 && downbeat <= duration)) return "downbeat must be a time inside the song";
+  if (key === null || key === undefined) return { bpm, downbeat, key: null };
+  if (typeof key !== "object") return "key must be { tonic, minor } or null";
+  const { tonic, minor } = key as Record<string, unknown>;
+  if (typeof tonic !== "number" || !Number.isInteger(tonic) || tonic < 0 || tonic > 11 || typeof minor !== "boolean") {
+    return "key must be { tonic: 0..11, minor: boolean }";
+  }
+  return { bpm, downbeat, key: { tonic, minor } };
+}
+
 type Handler<R extends Request> = (req: R, server: Server<unknown>) => Response | Promise<Response>;
 
 /** API routes need the access cookie when a password is set. */
 function guarded<R extends Request>(handler: Handler<R>): Handler<R> {
   return (req, server) => (hasAccess(req) ? handler(req, server) : accessRequired());
+}
+
+/** Re-analysis costs about as much as analysing a new song, so it shares the add limits. */
+async function retune(req: Request, server: Server<unknown>, track: Parameters<typeof retuneTrack>[0], overrides: GridOverrides | null): Promise<Response> {
+  // Checked before the rate limit, so a refused change does not cost a token.
+  if (isProcessing(track.id)) return Response.json({ error: "This song is still processing. Try again when it is ready." }, { status: 409 });
+  if (config.maxQueuedSongs > 0 && queuedCount() >= config.maxQueuedSongs) {
+    return Response.json({ error: "Busy processing other songs. Try again in a few minutes." }, { status: 503, headers: { "Retry-After": "120" } });
+  }
+  const wait = limits.addsPerIp.take(clientIp(req, server));
+  if (wait) return tooMany(wait, `Too many changes. Try again in ${Math.ceil(wait / 60)} minutes.`);
+  retuneTrack(track, overrides);
+  return Response.json(track);
 }
 
 await loadTracks();
@@ -115,6 +146,24 @@ const server = Bun.serve({
       GET: guarded((req) => {
         const track = getTrack(req.params.id);
         return track ? Response.json(track) : notFound();
+      }),
+    },
+
+    "/api/tracks/:id/grid": {
+      // Hand-made tempo, downbeat and key corrections; the analysis re-runs with them.
+      PUT: guarded(async (req, server) => {
+        if (isCrossSite(req)) return Response.json({ error: "Cross-site requests are not allowed" }, { status: 403 });
+        const track = getTrack(req.params.id);
+        if (!track?.analysis) return notFound();
+        const overrides = parseOverrides(await req.json().catch(() => null), track.analysis.duration);
+        if (typeof overrides === "string") return badRequest(overrides);
+        return retune(req, server, track, overrides);
+      }),
+      DELETE: guarded(async (req, server) => {
+        if (isCrossSite(req)) return Response.json({ error: "Cross-site requests are not allowed" }, { status: 403 });
+        const track = getTrack(req.params.id);
+        if (!track?.analysis) return notFound();
+        return retune(req, server, track, null);
       }),
     },
 

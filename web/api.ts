@@ -1,4 +1,4 @@
-import type { SearchResult, Track } from "../shared/types";
+import type { GridOverrides, SearchResult, Track } from "../shared/types";
 
 /** A failed API call. `status` 401 means the server wants the access password. */
 export class ApiError extends Error {
@@ -32,5 +32,9 @@ export const searchVideos = (q: string): Promise<{ results: SearchResult[]; vide
   request(`/api/search?q=${encodeURIComponent(q)}`);
 
 export const addTrack = (url: string, title?: string): Promise<Track> => request("/api/tracks", json({ url, title }));
+
+/** Saves hand-made grid and key corrections, or resets to the detected ones with null. */
+export const retune = (id: string, overrides: GridOverrides | null): Promise<Track> =>
+  request(`/api/tracks/${id}/grid`, overrides ? { ...json(overrides), method: "PUT" } : { method: "DELETE" });
 
 export const unlock = (password: string): Promise<{ access: boolean }> => request("/api/session", json({ password }));

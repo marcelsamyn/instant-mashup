@@ -1,4 +1,5 @@
 import type { Analysis, AudioSource, MusicalKey, Stem, Track } from "../shared/types";
+import { camelot } from "../shared/keys";
 import { STEMS } from "../shared/types";
 
 export type InStyle = "fade" | "filter";
@@ -113,9 +114,15 @@ export function barTime(analysis: Analysis, bar: number): number {
   return analysis.downbeat + bar * 4 * analysis.beatSec;
 }
 
-/** Audio exists on the server: finished, or past download and splitting stems (the mix plays meanwhile). */
+/**
+ * Audio exists on the server: finished, past download and splitting stems (the mix plays
+ * meanwhile), or a finished song being re-analysed after a tune, or whose re-analysis failed
+ * (its audio and stems are untouched either way).
+ */
 export function isPlayable(track: Track): boolean {
-  return track.analysis !== null && (track.status === "ready" || track.status === "separating");
+  if (track.analysis === null) return false;
+  if (track.status === "ready" || track.status === "separating") return true;
+  return (track.status === "analyzing" || track.status === "error") && track.stemLevels !== null;
 }
 
 /** Sources a lane needs: the stems its clips use, or the full mix while stems are still being made. */
@@ -130,14 +137,6 @@ export function bestBpmFactor(bpm: number, masterBpm: number): BpmFactor {
   return factors.reduce((best, f) =>
     Math.abs(Math.log(masterBpm / (bpm * f))) < Math.abs(Math.log(masterBpm / (bpm * best))) ? f : best,
   );
-}
-
-// Camelot number for each major tonic (pitch class); minor keys use their relative major's number.
-const CAMELOT_MAJOR = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1] as const;
-
-export function camelot(tonic: number, minor: boolean): { number: number; letter: "A" | "B" } {
-  const majorTonic = (((minor ? tonic + 3 : tonic) % 12) + 12) % 12;
-  return { number: CAMELOT_MAJOR[majorTonic] ?? 8, letter: minor ? "A" : "B" };
 }
 
 /** 0 = same key, 1 = relative or neighbour on the wheel (mixes well), higher clashes more. */

@@ -4,10 +4,11 @@
 # ///
 """Music analysis for the mashup app.
 
-  analyze.py track <audio.wav>                  -> track analysis JSON on stdout
+  analyze.py track <audio.wav> [--bpm B] [--downbeat T]  -> track analysis JSON on stdout
   analyze.py stems <analysis.json> <stems dir>  -> per-bar stem levels (dBFS) JSON on stdout
 """
 
+import argparse
 import json
 import sys
 
@@ -61,11 +62,12 @@ def tracked_period(onset: np.ndarray) -> float:
     return float(slope)
 
 
-def refine_grid(y: np.ndarray, period: float) -> tuple[float, float]:
+def refine_grid(y: np.ndarray, period: float, search: bool = True) -> tuple[float, float]:
     """
     Sharpen the tracked tempo: fold a fine onset envelope over candidate beat periods and keep the
     one where onsets pile up tightest. A 0.5 BPM error drifts a full beat within a few minutes, so
-    beat matching needs this precision. Returns (seconds per beat, time of a beat).
+    beat matching needs this precision. With search=False the period is taken as given (a tempo
+    set by hand) and only the beat phase is found. Returns (seconds per beat, time of a beat).
     """
     hop = 128
     onset = librosa.onset.onset_strength(y=y, sr=SR, hop_length=hop)
@@ -76,6 +78,8 @@ def refine_grid(y: np.ndarray, period: float) -> tuple[float, float]:
         smooth = np.convolve(np.r_[hist[-2:], hist, hist[:2]], np.ones(5) / 5, "valid")
         return float(smooth.max() / (smooth.mean() + 1e-9)), float(np.argmax(smooth) / 128 * p)
 
+    if not search:
+        return period, fold(period)[1]
     bpm = 60 / period
     for span, step in ((0.03 * bpm, 0.05), (0.1, 0.002)):
         candidates = np.arange(bpm - span, bpm + span, step)
@@ -203,7 +207,8 @@ def waveform(y: np.ndarray) -> dict:
     return out
 
 
-def analyze_track(path: str) -> dict:
+def analyze_track(path: str, bpm: float | None = None, downbeat: float | None = None) -> dict:
+    """Full analysis. `bpm` and `downbeat` (time of any bar start, seconds) override the detected grid."""
     y, _ = librosa.load(path, sr=SR, mono=True)
     duration = len(y) / SR
     onset = librosa.onset.onset_strength(y=y, sr=SR, hop_length=HOP)
@@ -214,10 +219,14 @@ def analyze_track(path: str) -> dict:
     rms_db = librosa.amplitude_to_db(librosa.feature.rms(y=y, hop_length=HOP), ref=1.0)
     low_db = mel_db[:8].mean(axis=0, keepdims=True)
 
-    beat_sec, beat_ref = refine_grid(y, tracked_period(onset))
-    first_beat = beat_ref - np.floor(beat_ref / beat_sec) * beat_sec
-    beat_times = np.arange(first_beat, duration, beat_sec)
-    downbeat = first_beat + downbeat_phase(beat_times, low_onset, chroma) * beat_sec
+    if bpm:
+        beat_sec, beat_ref = refine_grid(y, 60 / bpm, search=False)
+    else:
+        beat_sec, beat_ref = refine_grid(y, tracked_period(onset))
+    if downbeat is None:
+        first_beat = beat_ref - np.floor(beat_ref / beat_sec) * beat_sec
+        beat_times = np.arange(first_beat, duration, beat_sec)
+        downbeat = first_beat + downbeat_phase(beat_times, low_onset, chroma) * beat_sec
     bar_sec = 4 * beat_sec
     bar0 = downbeat - np.ceil(downbeat / bar_sec) * bar_sec
     n_bars = int(np.ceil((duration - bar0) / bar_sec))
@@ -284,7 +293,12 @@ def stem_levels(analysis_path: str, stems_dir: str) -> dict:
 if __name__ == "__main__":
     command, *args = sys.argv[1:]
     if command == "track":
-        result = analyze_track(args[0])
+        parser = argparse.ArgumentParser(prog="analyze.py track")
+        parser.add_argument("audio")
+        parser.add_argument("--bpm", type=float)
+        parser.add_argument("--downbeat", type=float)
+        opts = parser.parse_args(args)
+        result = analyze_track(opts.audio, opts.bpm, opts.downbeat)
     elif command == "stems":
         result = stem_levels(args[0], args[1])
     else:

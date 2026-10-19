@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { Track } from "../shared/types";
 import { ApiError, addTrack, fetchTracks } from "./api";
 import { AccessGate } from "./components/AccessGate";
+import { TuneDialog } from "./components/TuneDialog";
 import { type BufferLookup, BufferStore, bufferNeeds } from "./buffers";
 import { Inspector } from "./components/Inspector";
 import { Library } from "./components/Library";
@@ -64,6 +65,12 @@ function loadSaved(): { project: Project; queue: string[] } {
   return { project: EMPTY_PROJECT, queue: [] };
 }
 
+/** Changes whenever a (re-)analysis produced a different grid, key or sectioning. */
+function analysisSignature(t: Track): string {
+  const a = t.analysis;
+  return a ? `${a.bpm}|${a.downbeat}|${a.key.camelot}|${a.sections.length}|${a.tuned ?? false}` : "";
+}
+
 /** Keeps the previous object for tracks that did not change, so polling does not re-render everything. */
 function mergeTracks(prev: Track[], next: Track[]): Track[] {
   const byId = new Map(prev.map((t) => [t.id, t]));
@@ -75,7 +82,7 @@ function mergeTracks(prev: Track[], next: Track[]): Track[] {
       old.status === t.status &&
       old.error === t.error &&
       old.title === t.title &&
-      Boolean(old.analysis) === Boolean(t.analysis) &&
+      analysisSignature(old) === analysisSignature(t) &&
       Boolean(old.stemLevels) === Boolean(t.stemLevels);
     if (same) return old;
     changed = true;
@@ -101,6 +108,7 @@ export function App(): React.JSX.Element {
   const [loading, setLoading] = useState<{ done: number; total: number } | null>(null);
   const [exporting, setExporting] = useState(false);
   const [locked, setLocked] = useState(false);
+  const [tuningId, setTuningId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error"; id: number } | null>(null);
 
   const project = history.present;
@@ -175,7 +183,8 @@ export function App(): React.JSX.Element {
     lanes: project.lanes.map((l) => [l.id, l.trackId, l.bpmFactor, l.semitones, l.nudge]),
     ready: project.lanes.map((l) => {
       const t = tracksById.get(l.trackId);
-      return [Boolean(t && isPlayable(t)), Boolean(t?.stemLevels)];
+      // The signature catches a re-tune even when no status flag changes in between polls.
+      return [Boolean(t && isPlayable(t)), Boolean(t?.stemLevels), t ? analysisSignature(t) : ""];
     }),
   });
   useEffect(() => {
@@ -297,6 +306,8 @@ export function App(): React.JSX.Element {
     setSelectedLaneId(lane.id);
   }
 
+  const tuningTrack = tuningId ? tracksById.get(tuningId) : undefined;
+  const tuning = tuningTrack && isAnalysed(tuningTrack) ? tuningTrack : null;
   const selectedClip = project.clips.find((c) => c.id === selectedClipId) ?? null;
   const selectedClipLane = selectedClip ? project.lanes.find((l) => l.id === selectedClip.laneId) : undefined;
 
@@ -412,6 +423,14 @@ export function App(): React.JSX.Element {
         onToggleQueue={(id) => setQueue((q) => (q.includes(id) ? q.filter((x) => x !== id) : [...q, id]))}
         onMakeMashup={makeMashup}
         onMakeMix={makeMix}
+        onTune={(t) => {
+          // The tuner's click track should not play over the mix.
+          if (engine.playing) {
+            engine.pause();
+            setPlaying(false);
+          }
+          setTuningId(t.id);
+        }}
       />
       <Timeline
         project={project}
@@ -442,6 +461,18 @@ export function App(): React.JSX.Element {
         />
       </div>
       {locked && <AccessGate onUnlock={() => setLocked(false)} />}
+      {tuning && (
+        <TuneDialog
+          track={tuning}
+          ctx={engine.ctx}
+          onClose={() => setTuningId(null)}
+          onSaved={(updated) => {
+            setTuningId(null);
+            setTracks((prev) => mergeTracks(prev, prev.map((t) => (t.id === updated.id ? updated : t))));
+            notify(`Re-analysing ${shortTitle(updated)} with the new grid. It keeps playing meanwhile.`);
+          }}
+        />
+      )}
       {toast && (
         <div key={toast.id} className={`toast toast-${toast.tone}`} role="status">
           {toast.text}
