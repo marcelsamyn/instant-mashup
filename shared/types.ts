@@ -36,11 +36,22 @@ export interface Analysis {
   key: MusicalKey;
   sections: Section[];
   barEnergy: number[];
+  /** True when the tempo, downbeat or key was set by hand in the tuner. */
+  tuned?: boolean;
   waveform: { rate: number; low: number[]; mid: number[]; high: number[] };
 }
 
 /** RMS level of each stem per bar, in dBFS. */
 export type StemLevels = Record<Stem, number[]>;
+
+/** Corrections made by hand. The analysis re-runs with them; sections and energy follow the new grid. */
+export interface GridOverrides {
+  bpm: number;
+  /** Time in seconds of any bar start. */
+  downbeat: number;
+  /** null keeps the detected key. */
+  key: { tonic: number; minor: boolean } | null;
+}
 
 export type TrackStatus = "downloading" | "analyzing" | "separating" | "ready" | "error";
 
@@ -52,6 +63,8 @@ export interface Track {
   thumbnail: string;
   status: TrackStatus;
   error: string | null;
+  /** Epoch milliseconds when the song was added to the library. */
+  addedAt: number;
   analysis: Analysis | null;
   stemLevels: StemLevels | null;
 }

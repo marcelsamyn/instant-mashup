@@ -1,6 +1,7 @@
 import { mkdir, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import path from "node:path";
-import { type Analysis, type AudioSource, STEMS, type StemLevels, type Track, thumbnailUrl } from "../shared/types";
+import { musicalKey } from "../shared/keys";
+import { type Analysis, type AudioSource, type GridOverrides, STEMS, type StemLevels, type Track, thumbnailUrl } from "../shared/types";
 import { config } from "./config";
 import { concurrency } from "./limits";
 import { run } from "./run";
@@ -10,6 +11,7 @@ const tracks = new Map<string, Track>();
 const trackDir = (id: string): string => path.join(config.dataDir, id);
 const sourcePath = (id: string): string => path.join(trackDir(id), "source.wav");
 const stemPath = (id: string, stem: string): string => path.join(trackDir(id), "stems", `${stem}.wav`);
+const overridesPath = (id: string): string => path.join(trackDir(id), "overrides.json");
 
 const downloadSlot = concurrency(config.parallelDownloads);
 const analysisSlot = concurrency(config.parallelAnalyses);
@@ -64,33 +66,66 @@ async function stemsOnDisk(id: string): Promise<boolean> {
 /** Tracks with a pipeline run in flight, so a repair never starts a second one. */
 const active = new Set<string>();
 
+const analysisPath = (id: string): string => path.join(trackDir(id), "analysis.json");
+const levelsPath = (id: string): string => path.join(trackDir(id), "stems.json");
+const mtime = (file: string): Promise<number> => stat(file).then((s) => s.mtimeMs, () => 0);
+
+/**
+ * The analysis no longer matches the hand-made corrections on disk: they were added or changed
+ * after it was written, or removed while it still carries them. Judged from files, so a re-tune
+ * interrupted by a restart still completes.
+ */
+async function analysisOutdated(track: Track): Promise<boolean> {
+  if (!track.analysis) return true;
+  const overridesAt = await mtime(overridesPath(track.id));
+  if (overridesAt === 0) return track.analysis.tuned === true;
+  return overridesAt > (await mtime(analysisPath(track.id)));
+}
+
+/** Runs the analysis, applying any hand-made grid and key corrections. */
+async function analyse(id: string): Promise<Analysis> {
+  const overrides = await readJson<GridOverrides>(overridesPath(id));
+  const grid = overrides ? ["--bpm", String(overrides.bpm), "--downbeat", String(overrides.downbeat)] : [];
+  const out = await analysisSlot(() => run([...config.tools.analyze, "track", sourcePath(id), ...grid]));
+  const analysis = JSON.parse(out) as Analysis;
+  if (overrides?.key) analysis.key = musicalKey(overrides.key.tonic, overrides.key.minor);
+  analysis.tuned = overrides !== null;
+  return analysis;
+}
+
 /**
  * Runs whatever pipeline steps a track is missing, judged by the files on disk: download,
  * analysis, stem separation, stem levels. Also how a track heals when its audio was deleted or
  * not copied along with the rest of its folder.
  */
-async function processTrack(track: Track): Promise<void> {
+async function processTrack(track: Track, prepare?: () => Promise<void>): Promise<void> {
+  // Claimed before the first await, so concurrent callers see the song as busy.
   if (active.has(track.id)) return;
   active.add(track.id);
   const dir = trackDir(track.id);
   try {
+    await prepare?.();
     if (!(await Bun.file(sourcePath(track.id)).exists())) {
       await update(track, { status: "downloading", error: null });
       const info = await downloadSlot(() => downloadAudio(track.id, dir));
       await update(track, info);
     }
-    if (!track.analysis) {
+    if (await analysisOutdated(track)) {
+      // A re-tune keeps the old analysis on screen until the new one is ready.
       await update(track, { status: "analyzing", error: null });
-      const out = await analysisSlot(() => run([...config.tools.analyze, "track", sourcePath(track.id)]));
-      await writeAtomic(path.join(dir, "analysis.json"), out);
-      track.analysis = JSON.parse(out) as Analysis;
+      const analysis = await analyse(track.id);
+      await writeAtomic(analysisPath(track.id), JSON.stringify(analysis));
+      track.analysis = analysis;
     }
     if (!(await stemsOnDisk(track.id))) {
       // Stem levels describe stems that are gone; drop them so clients play the full mix meanwhile.
       track.stemLevels = null;
     }
-    if (!track.stemLevels) {
-      await update(track, { status: "separating", error: null });
+    // Stem levels are measured per bar, so a new grid needs them measured again. The old levels
+    // stay in use meanwhile, so the song keeps playing from its stems.
+    const levelsOutdated = (await mtime(levelsPath(track.id))) < (await mtime(analysisPath(track.id)));
+    if (!track.stemLevels || levelsOutdated) {
+      if (!track.stemLevels) await update(track, { status: "separating", error: null });
       if (!(await stemsOnDisk(track.id))) await separationSlot(() => separate(track.id));
       const out = await run([...config.tools.analyze, "stems", path.join(dir, "analysis.json"), path.join(dir, "stems")]);
       await writeAtomic(path.join(dir, "stems.json"), out);
@@ -129,6 +164,7 @@ export async function loadTracks(): Promise<void> {
       if (!meta) continue;
       const track: Track = {
         ...meta,
+        addedAt: meta.addedAt ?? (await stat(trackDir(id))).birthtimeMs,
         analysis: await readJson<Analysis>(path.join(trackDir(id), "analysis.json")),
         stemLevels: await readJson<StemLevels>(path.join(trackDir(id), "stems.json")),
       };
@@ -167,6 +203,7 @@ export async function addTrack(id: string, hint?: { title?: string; channel?: st
     thumbnail: thumbnailUrl(id),
     status: "downloading",
     error: null,
+    addedAt: Date.now(),
     analysis: null,
     stemLevels: null,
   };
@@ -176,6 +213,21 @@ export async function addTrack(id: string, hint?: { title?: string; channel?: st
   void processTrack(track);
   return track;
 }
+
+export class TrackBusyError extends Error {}
+
+/**
+ * Saves hand-made grid and key corrections (null resets to the detected values) and re-runs the
+ * analysis and stem levels. Download and stem separation are not repeated.
+ */
+export function retuneTrack(track: Track, overrides: GridOverrides | null): void {
+  if (isProcessing(track.id)) throw new TrackBusyError("This song is still processing. Try again when it is ready.");
+  void processTrack(track, () =>
+    overrides ? writeAtomic(overridesPath(track.id), JSON.stringify(overrides, null, 2)) : rm(overridesPath(track.id), { force: true }),
+  );
+}
+
+export const isProcessing = (id: string): boolean => active.has(id);
 
 const lastTouched = new Map<string, number>();
 
