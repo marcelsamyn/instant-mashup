@@ -1280,12 +1280,15 @@ kbd {
   position: absolute;
   top: 0;
   bottom: 0;
+  overflow: hidden;
   border-top: 3px solid;
   border-left: 1px solid rgb(255 255 255 / 0.12);
 }
 
 .clip-section span {
   display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 2px 5px;
   font: 650 8.5px var(--font-ui);
   font-stretch: 110%;

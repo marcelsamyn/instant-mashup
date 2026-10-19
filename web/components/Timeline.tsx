@@ -280,7 +280,9 @@ const ClipView = memo(function ClipView(props: ClipViewProps): React.JSX.Element
 
   const sections = analysis.sections
     .map((s) => ({ s, x0: ((s.start - src0) / secPerBeat) * ppb, x1: ((s.end - src0) / secPerBeat) * ppb }))
-    .filter(({ x0, x1 }) => x1 > 0 && x0 < width);
+    // A section that only grazes the clip (a clip starting exactly on a boundary leaves the
+    // previous section a rounding error wide) would stack its label on the real one.
+    .filter(({ x0, x1 }) => Math.min(width, x1) - Math.max(0, x0) >= 2);
   const fadeInPx = clip.fadeIn * ppb;
   const fadeOutPx = clip.fadeOut * ppb;
   const playsVocalsOnly = props.hasStems && STEMS.filter((s) => clip.stems[s]).length === 1;
